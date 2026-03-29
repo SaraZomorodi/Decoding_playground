@@ -78,7 +78,7 @@ class TrajectorySegments():
         plt.ylabel("y (cm)")
         plt.title(f"Segments with 3 < speed < 100 and at least {self.edge_margin} cm from edge")
         plt.legend()
-        plt.show()
+        # plt.show()
 
 
     def using_segments(self, segments ):
@@ -109,10 +109,11 @@ class TrajectorySegments():
 class DecoderMLE():
     def __init__(self , RAT_ID , LIGHTING ):
         rat = RAT(n=RAT_ID, lighting=LIGHTING, filter_speed=False) 
-        self.t = rat.T  # (s), starts at 0 
-        self.x = rat.X  # (cm) 
-        self.y = rat.Y  # (cm) 
-        self.v = rat.V  # (cm/s)
+        self.t = rat.T   # (s), starts at 0 
+        self.x = rat.X   # (cm) 
+        self.y = rat.Y   # (cm) 
+        self.v = rat.V   # (cm/s)
+        self.hd = rat.HD # rad
             
         # Choose which spikes to use 
         self.spikes_by_cell = {} 
@@ -435,7 +436,7 @@ class DecoderMLE():
         cbar.set_label('Speed (cm/s)')
 
         ax.legend()
-        plt.show()
+        # plt.show()
 
 
     def get_distance_based_windows(self , t, x, y, dist_step=5.0):
@@ -512,3 +513,94 @@ class DecoderMLE():
     
 
     
+
+
+
+class MakePlots():
+    def __init__(self , edge_margin= 15 , arena_radius= 75 , RAT_ID=2 , LIGHTING='light' ):
+        self.edge_margin    = edge_margin
+        self.arena_radius   = arena_radius
+        self.RAT_ID         = RAT_ID
+        self.LIGHTING       = LIGHTING
+
+
+        self.rat = TrajectorySegments(edge_margin= self.edge_margin , arena_radius= self.arena_radius , RAT_ID=self.RAT_ID , LIGHTING=self.LIGHTING)
+        self.segments = self.rat.segments
+        self.rat_decode = DecoderMLE(RAT_ID=self.RAT_ID , LIGHTING=self.LIGHTING)
+
+    def get_error_vs_distance_traveled(self, dist_step=8.0):
+        all_dists = []
+        all_errors = []
+
+        for seg in self.segments:
+            s, e = int(seg[0]), int(seg[1])
+            
+            # 1. Decode the segment
+            dec = self.rat_decode.decode_segment_adaptive(seg , dist_step = dist_step)
+            if len(dec) == 0: continue
+
+            # 2. Calculate cumulative distance for the WHOLE segment trajectory
+            seg_x, seg_y = self.rat_decode.x[s:e], self.rat_decode.y[s:e]
+            dx = np.diff(seg_x, prepend=seg_x[0])
+            dy = np.diff(seg_y, prepend=seg_y[0])
+            dr = np.sqrt(dx**2 + dy**2)
+            cum_dist_full = np.cumsum(np.nan_to_num(dr))
+            t_seg = self.rat_decode.t[s:e]
+
+            # 3. Interpolate distance at the decoding midpoints (dec[:, 0])
+            dist_at_windows = np.interp(dec[:, 0], t_seg, cum_dist_full)
+            
+            # 4. Error calculation
+            err = np.sqrt((dec[:, 1] - dec[:, 3])**2 + (dec[:, 2] - dec[:, 4])**2)
+            
+            all_dists.extend(dist_at_windows)
+            all_errors.extend(err)
+            
+        return np.array(all_dists), np.array(all_errors)
+
+
+
+    def plot_traveled_space(self,  dist_step=8.0 , dist_bins_ = 5.0):
+        dist_vals, err_vals = self.get_error_vs_distance_traveled(dist_step=dist_step)
+
+        # 1. Binning by distance (e.g., every 5 cm)
+        d_bins = np.arange(0, np.percentile(dist_vals, 95), dist_bins_) 
+        bin_centers = 0.5 * (d_bins[:-1] + d_bins[1:])
+        
+        bin_means, bin_sem, bin_counts = [], [], []
+
+        for i in range(len(d_bins)-1):
+            mask = (dist_vals >= d_bins[i]) & (dist_vals < d_bins[i+1])
+            count = np.sum(mask)
+            bin_counts.append(count)
+            
+            if count > 0:
+                bin_means.append(np.mean(err_vals[mask]))
+                bin_sem.append(np.std(err_vals[mask]) / np.sqrt(count))
+            else:
+                bin_means.append(np.nan)
+                bin_sem.append(np.nan)
+
+        # 2. Create the figure and the first axis (Error)
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+
+        # Plot Error Line (Primary Y-axis)
+        ax1.errorbar(bin_centers, bin_means, yerr=bin_sem, fmt='-s', 
+                    color='darkorange', ecolor='gray', capsize=3, lw=2, label='Mean Error')
+        ax1.set_xlabel('Cumulative Distance Traveled in Segment (cm)', fontsize=12)
+        ax1.set_ylabel('Mean Decoding Error (cm)', color='darkorange', fontsize=12)
+        ax1.tick_params(axis='y', labelcolor='darkorange')
+        ax1.grid(True, linestyle='--', alpha=0.3)
+
+        # 3. Create the second axis (Sample Count)
+        ax2 = ax1.twinx()
+        # Plot Sample Count Bars (Secondary Y-axis)
+        # width matches the bin size (5.0) with a slight gap for aesthetics
+        ax2.bar(bin_centers, bin_counts, width=4.0, alpha=0.15, color='gray', label='Sample Count')
+        ax2.set_ylabel('Number of Windows (Sample Count)', color='gray', fontsize=12)
+        ax2.tick_params(axis='y', labelcolor='gray')
+
+        plt.title(f'Decoding Performance & Data Density vs. Path Distance (step={dist_step}cm)', fontsize=14)
+        fig.tight_layout()
+        # plt.show()
+
