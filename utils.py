@@ -2,9 +2,10 @@ import numpy as np
 import os
 
 class RAT:
-    def __init__(self , n , lighting , filter_speed = True):
+    def __init__(self , n , lighting , filter_speed = True , t_max=1367.99):
         self.file_name = self.rat_retrieve(n)
         self.lighting = lighting
+        self.t_max = t_max
 
         self.this_rat = self.opening_files()
 
@@ -82,7 +83,38 @@ class RAT:
         speed = np.sqrt( ( this_rat['x'][1:] - this_rat['x'][:-1] )**2 + ( this_rat['y'][1:] - this_rat['y'][:-1] ) **2 )  / dt
         this_rat['speed'] = np.append([0] , speed) #assuming the motion is starting at speed 0
 
+
+        if self.t_max is not None:
+            # 1. Clip tracking data
+            valid_t_idx = this_rat['t'] <= self.t_max
+            
+            this_rat['t'] = this_rat['t'][valid_t_idx]
+            this_rat['x'] = this_rat['x'][valid_t_idx]
+            this_rat['y'] = this_rat['y'][valid_t_idx]
+            this_rat['z'] = this_rat['z'][valid_t_idx]
+            this_rat['hd'] = this_rat['hd'][valid_t_idx]
+            this_rat['speed'] = this_rat['speed'][valid_t_idx]
+
+            # 2. Clip spike timestamps for all modules
+            for mod in ['grid_mod1', 'grid_mod2', 'grid_mod3']:
+                for cell_id, spikes in this_rat[mod].items():
+                    # Filter array to only keep spikes that happen before or at t_max
+                    this_rat[mod][cell_id] = spikes[spikes <= self.t_max]
+
         return this_rat
     
    
         
+# def find_k(array , value):
+#         """Finds index of the closest value in an array."""
+#         return (np.abs(array-value)).argmin()
+# def rate_map(x, y, t, margin ,spike, bin_width= 1):
+#         """Computes the firing rate map using 2D histogram binning."""                             
+#         x_edges = np.arange(min(x) - margin, max(x)+margin , bin_width)
+#         y_edges = np.arange(min(y) - margin, max(y)+margin , bin_width)
+#         ind_x = [find_k(t, i) for i in spike]
+#         ind_y = [find_k(t, i) for i in spike]
+#         occ = np.histogram2d(x, y, bins = (x_edges , y_edges))[0]
+#         act = np.histogram2d(x[ind_x], y[ind_y], bins = (x_edges , y_edges))[0]
+#         rate = act / (occ*0.02)
+#         return rate

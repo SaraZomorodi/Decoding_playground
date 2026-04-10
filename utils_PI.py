@@ -7,13 +7,13 @@ from utils import RAT
 
 
 class TrajectorySegments():
-    def __init__(self , edge_margin , arena_radius , RAT_ID  , LIGHTING):
+    def __init__(self , edge_margin , arena_radius , RAT_ID  , LIGHTING , t_max = 1367.99):
         # arena parameters
         self.arena_radius = arena_radius   # cm
         self.edge_margin  = edge_margin    # cm
         self.valid_radius = arena_radius - edge_margin   
 
-        rat = RAT(n=RAT_ID, lighting=LIGHTING, filter_speed=False) 
+        rat = RAT(n=RAT_ID, lighting=LIGHTING, filter_speed=False , t_max=t_max) 
         self.t = rat.T  # (s), starts at 0 
         self.x = rat.X  # (cm) 
         self.y = rat.Y  # (cm) 
@@ -107,8 +107,8 @@ class TrajectorySegments():
 
 
 class DecoderMLE():
-    def __init__(self , RAT_ID , LIGHTING ):
-        rat = RAT(n=RAT_ID, lighting=LIGHTING, filter_speed=False) 
+    def __init__(self , RAT_ID , LIGHTING  , t_max = 1367.99):
+        rat = RAT(n=RAT_ID, lighting=LIGHTING, filter_speed=False , t_max = t_max) 
         self.t = rat.T   # (s), starts at 0 
         self.x = rat.X   # (cm) 
         self.y = rat.Y   # (cm) 
@@ -528,7 +528,7 @@ class MakePlots():
         self.segments = self.rat.segments
         self.rat_decode = DecoderMLE(RAT_ID=self.RAT_ID , LIGHTING=self.LIGHTING)
 
-    def get_error_vs_distance_traveled(self, dist_step=8.0):
+    def get_error_vs_distance_traveled(self, dist_step=8.0 ,  dt_decode=0.05 , adaptive = False):
         all_dists = []
         all_errors = []
 
@@ -536,7 +536,11 @@ class MakePlots():
             s, e = int(seg[0]), int(seg[1])
             
             # 1. Decode the segment
-            dec = self.rat_decode.decode_segment_adaptive(seg , dist_step = dist_step)
+            if adaptive:
+                dec = self.rat_decode.decode_segment_adaptive(seg , dist_step = dist_step)
+            else: 
+                dec ,  posteriors, K, window_edges =  self.rat_decode.decode_segment_bayes_uniform(
+                segment=seg , dt_decode=dt_decode )
             if len(dec) == 0: continue
 
             # 2. Calculate cumulative distance for the WHOLE segment trajectory
@@ -560,8 +564,8 @@ class MakePlots():
 
 
 
-    def plot_traveled_space(self,  dist_step=8.0 , dist_bins_ = 5.0):
-        dist_vals, err_vals = self.get_error_vs_distance_traveled(dist_step=dist_step)
+    def plot_traveled_space(self,  dist_step=8.0 , dist_bins_ = 5.0 ,  dt_decode=0.05 , adaptive = False ):
+        dist_vals, err_vals = self.get_error_vs_distance_traveled(dist_step=dist_step , dt_decode=dt_decode , adaptive=adaptive)
 
         # 1. Binning by distance (e.g., every 5 cm)
         d_bins = np.arange(0, np.percentile(dist_vals, 95), dist_bins_) 
@@ -604,3 +608,81 @@ class MakePlots():
         fig.tight_layout()
         # plt.show()
 
+
+
+    def get_error_vs_time_passed(self, dist_step=8.0 , dt_decode=0.05 , adaptive = False):
+        all_relative_times = []
+        all_errors = []
+
+        for seg in self.segments:
+            # 1. Decode using our adaptive windowing
+            if adaptive:
+                dec = self.rat_decode.decode_segment_adaptive(seg , dist_step = dist_step)
+            else:
+                dec ,  posteriors, K, window_edges =  self.rat_decode.decode_segment_bayes_uniform(
+                segment=seg , dt_decode=dt_decode )
+
+            if len(dec) == 0: continue
+                
+            # 2. Calculate time passed since segment start
+            t_start = seg[2] # t[s] from your segment list
+            relative_t = dec[:, 0] - t_start
+            
+            # 3. Calculate absolute error
+            dx = dec[:, 1] - dec[:, 3]
+            dy = dec[:, 2] - dec[:, 4]
+            err = np.sqrt(dx**2 + dy**2)
+            
+            all_relative_times.extend(relative_t)
+            all_errors.extend(err)
+            
+        return np.array(all_relative_times), np.array(all_errors)
+
+    def plot_passed_time(self, dist_step=8.0, dt_decode=0.05, adaptive=False):
+        rel_t, err_vals = self.get_error_vs_time_passed(dist_step=dist_step, dt_decode=dt_decode, adaptive=adaptive)
+
+        # 1. Define Bins
+        t_bins = np.arange(0, np.max(rel_t), 0.4)
+        bin_centers = 0.5 * (t_bins[:-1] + t_bins[1:])
+        
+        bin_means = []
+        bin_sem = []
+        bin_counts = []
+
+        # 2. Extract Stats per Bin
+        for i in range(len(t_bins)-1):
+            mask = (rel_t >= t_bins[i]) & (rel_t < t_bins[i+1])
+            count = np.sum(mask)
+            bin_counts.append(count)
+            
+            if count > 0:
+                bin_means.append(np.mean(err_vals[mask]))
+                bin_sem.append(np.std(err_vals[mask]) / np.sqrt(count))
+            else:
+                bin_means.append(np.nan)
+                bin_sem.append(np.nan)
+
+        # 3. Create Plot with Twin Axis
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+
+        # Plot the Mean Error (Primary Y-axis)
+        ax1.errorbar(bin_centers, bin_means, yerr=bin_sem, fmt='-o', 
+                     capsize=3, color='forestgreen', lw=2, label='Mean Error', zorder=3)
+        ax1.set_xlabel('Time Passed in Segment (s)', fontsize=12)
+        ax1.set_ylabel('Mean Decoding Error (cm)', color='forestgreen', fontsize=12)
+        ax1.tick_params(axis='y', labelcolor='forestgreen')
+        ax1.grid(alpha=0.2)
+
+        # Plot the Sample Count Histogram (Secondary Y-axis)
+        ax2 = ax1.twinx()
+        # width=0.35 to match your 0.4 bin size with a tiny gap
+        ax2.bar(bin_centers, bin_counts, width=0.35, alpha=0.15, color='gray', label='Sample Count', zorder=1)
+        ax2.set_ylabel('Number of Windows (Sample Count)', color='gray', fontsize=12)
+        ax2.tick_params(axis='y', labelcolor='gray')
+
+        plt.title('Decoding Stability & Data Density Over Segment Duration', fontsize=14)
+        fig.tight_layout()
+        plt.show()
+
+    def segments_stat(self):
+        pass
