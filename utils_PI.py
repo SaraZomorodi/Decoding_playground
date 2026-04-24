@@ -513,6 +513,380 @@ class DecoderMLE():
     
 
     
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter1d, gaussian_filter
+
+class WholeSessionDecoder(DecoderMLE):
+    def __init__(self, RAT_ID, LIGHTING, t_max=None, sigma_pos=2.0, min_v=3.0, max_v=100.0):
+        """
+        Overrides the initialization to apply Gaussian smoothing to positions,
+        recalculate velocity, and filter out spikes outside the valid speed range.
+        """
+        # Load base rat data (assuming 'RAT' is available in your namespace)
+        rat = RAT(n=RAT_ID, lighting=LIGHTING, filter_speed=True, t_max=t_max)
+        self.t = rat.T  # Use the continuous time array that matches smoothed positions
+        self.hd = rat.HD
+
+        # 1. Smooth X and Y coordinates
+        self.x = rat.X #gaussian_filter1d(rat.X, sigma=sigma_pos)
+        self.y = rat.Y #gaussian_filter1d(rat.Y, sigma=sigma_pos)
+        
+        # # 2. Calculate continuous velocity using smoothed positions & time steps
+        # vx = np.gradient(self.x, self.t)
+        # vy = np.gradient(self.y, self.t)
+        # self.v = np.sqrt(vx**2 + vy**2)
+        
+        self.v = rat.V 
+        self.min_v = min_v
+        self.max_v = max_v
+        
+        # 3. Load Spikes
+        self.spikes_by_cell = {}
+        self.spikes_by_cell.update(rat.grid_mod1)
+        self.spikes_by_cell.update(rat.grid_mod2)
+        self.spikes_by_cell.update(rat.grid_mod3)
+        
+        # 4. Filter spikes to only keep those within speed bounds
+        # self._filter_spikes_by_speed()
+        
+        # 5. Position bins & Bounded Rate Maps
+        self.x_edges, self.y_edges, self.x_centers, self.y_centers = self.make_position_bins()
+        self.rate_maps, self.occ = self.compute_bounded_rate_maps()
+
+        self.t_active  =rat.t_active
+        self.mapped_resume_times = rat.mapped_resume_times
+
+    # def _filter_spikes_by_speed(self):
+    #     """Removes any spike timestamps that occurred during invalid speeds."""
+    #     for cell_id, spikes in self.spikes_by_cell.items():
+    #         spikes = np.asarray(spikes, dtype=float)
+            
+    #         # Restrict to tracked recording window
+    #         valid_time = (spikes >= self.t[0]) & (spikes <= self.t[-1])
+    #         spikes = spikes[valid_time]
+            
+    #         if len(spikes) == 0:
+    #             self.spikes_by_cell[cell_id] = spikes
+    #             continue
+            
+    #         # Find the speed at the time the spike fired
+    #         idx = np.searchsorted(self.t, spikes)
+    #         idx = np.clip(idx, 0, len(self.t) - 1)
+    #         speeds_at_spikes = self.v[idx]
+            
+    #         # Apply strict [3, 100] speed bounds
+    #         valid_speed = (speeds_at_spikes >= self.min_v) & (speeds_at_spikes <= self.max_v)
+    #         self.spikes_by_cell[cell_id] = spikes[valid_speed]
+
+    # def compute_bounded_rate_maps(self, smooth_sigma=1.0, occ_epsilon=1e-6):
+    #     """
+    #     Re-implements map building with an upper-speed boundary check.
+    #     """
+    #     # Occupancy Calculation
+    #     dt_samples = np.diff(self.t)
+    #     dt_per_sample = np.empty_like(self.t, dtype=float)
+    #     if len(dt_samples) > 0:
+    #         dt_per_sample[:-1] = dt_samples
+    #         dt_per_sample[-1] = dt_samples[-1]
+        
+    #     valid = np.isfinite(self.x) & np.isfinite(self.y) & np.isfinite(dt_per_sample)
+    #     valid &= (self.v >= self.min_v) & (self.v <= self.max_v)
+        
+    #     occ, _, _ = np.histogram2d(
+    #         self.x[valid], self.y[valid],
+    #         bins=[self.x_edges, self.y_edges],
+    #         weights=dt_per_sample[valid]
+    #     )
+        
+    #     occ_smooth = gaussian_filter(occ, smooth_sigma, mode="constant") if smooth_sigma else occ.copy()
+        
+    #     rate_maps = {}
+    #     for cell_id, spike_times in self.spikes_by_cell.items():
+    #         # Spikes are already filtered by speed, so we directly map them
+    #         if len(spike_times) == 0:
+    #             spike_map = np.zeros_like(occ)
+    #         else:
+    #             idx = np.searchsorted(self.t, spike_times)
+    #             idx = np.clip(idx, 0, len(self.t) - 1)
+                
+    #             valid_mask = np.isfinite(self.x[idx]) & np.isfinite(self.y[idx])
+    #             spike_map, _, _ = np.histogram2d(
+    #                 self.x[idx][valid_mask], self.y[idx][valid_mask],
+    #                 bins=[self.x_edges, self.y_edges]
+    #             )
+            
+    #         if smooth_sigma:
+    #             spike_map = gaussian_filter(spike_map, smooth_sigma, mode="constant")
+                
+    #         rate_maps[cell_id] = spike_map / (occ_smooth + occ_epsilon)
+            
+    #     return rate_maps, occ
+    
+    def compute_bounded_rate_maps(self, smooth_sigma=1.0, occ_epsilon=1e-6, arena_radius=75.0):
+        """
+        Re-implements map building with an upper-speed boundary check and 
+        constrains the rate maps strictly to a circular arena.
+        """
+        # Occupancy Calculation
+        dt_samples = np.diff(self.t)
+        dt_per_sample = np.empty_like(self.t, dtype=float)
+        if len(dt_samples) > 0:
+            dt_per_sample[:-1] = dt_samples
+            dt_per_sample[-1] = dt_samples[-1]
+        
+        valid = np.isfinite(self.x) & np.isfinite(self.y) & np.isfinite(dt_per_sample)
+        valid &= (self.v >= self.min_v) & (self.v <= self.max_v)
+        
+        occ, _, _ = np.histogram2d(
+            self.x[valid], self.y[valid],
+            bins=[self.x_edges, self.y_edges],
+            weights=dt_per_sample[valid]
+        )
+        
+        occ_smooth = gaussian_filter(occ, smooth_sigma, mode="constant") if smooth_sigma else occ.copy()
+        
+        # ==========================================
+        # CREATE CIRCULAR ARENA MASK
+        # ==========================================
+        # indexing='ij' ensures the meshgrid shape matches histogram2d output (X, Y)
+        X_grid, Y_grid = np.meshgrid(self.x_centers, self.y_centers, indexing='ij')
+        
+        # Boolean mask: True if inside the 75cm radius, False otherwise
+        arena_mask = (X_grid**2 + Y_grid**2) <= (arena_radius**2)
+        
+        rate_maps = {}
+        for cell_id, spike_times in self.spikes_by_cell.items():
+            # Spikes are already filtered by speed, so we directly map them
+            if len(spike_times) == 0:
+                spike_map = np.zeros_like(occ)
+            else:
+                idx = np.searchsorted(self.t, spike_times)
+                idx = np.clip(idx, 0, len(self.t) - 1)
+                
+                valid_mask = np.isfinite(self.x[idx]) & np.isfinite(self.y[idx])
+                spike_map, _, _ = np.histogram2d(
+                    self.x[idx][valid_mask], self.y[idx][valid_mask],
+                    bins=[self.x_edges, self.y_edges]
+                )
+            
+            if smooth_sigma:
+                spike_map = gaussian_filter(spike_map, smooth_sigma, mode="constant")
+                
+            # Calculate raw rate map
+            raw_rate_map = spike_map / (occ_smooth + occ_epsilon)
+            
+            # ==========================================
+            # APPLY THE MASK
+            # ==========================================
+            # Force the firing rate to 0.0 outside the circular arena
+            raw_rate_map[~arena_mask] = 0.0
+            
+            rate_maps[cell_id] = raw_rate_map
+            
+        # Optional: You can also mask the occupancy map if you plan to plot it
+        occ[~arena_mask] = 0.0
+            
+        return rate_maps, occ
+
+    def decode_whole_trajectory(self, dt_decode=0.1):
+        """
+        Decodes the entire session array and masks the output so only 
+        the intervals conforming to the speed bounds are returned.
+        """
+        s_idx = 0
+        e_idx = len(self.t) - 1
+        
+        # Inherited from DecoderMLE
+        decoded, posteriors, K, window_edges = self.decode_segment_bayes_uniform(
+            segment=[s_idx, e_idx], dt_decode=dt_decode
+        )
+        
+        # Filter decoded output (removing intervals outside the bounds)
+        t_mid = decoded[:, 0]
+        v_mid = np.interp(t_mid, self.t, self.v)
+        valid_mask = (v_mid >= self.min_v) & (v_mid <= self.max_v)
+        
+        return decoded[valid_mask]
+
+    def plot_1d_trajectories(self, decoded):
+        """
+        Plots Decoded X vs True X, and Decoded Y vs True Y individually over time.
+        """
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+        
+        t_dec = decoded[:, 0]
+        x_pred, y_pred = decoded[:, 1], decoded[:, 2]
+        x_true, y_true = decoded[:, 3], decoded[:, 4]
+        
+        # Plot X Data
+        ax1.plot(t_dec, x_true, label='True X', color='black', alpha=0.6, linewidth=2)
+        ax1.plot(t_dec, x_pred, label='Decoded X', color='red', s=10, alpha=0.7)
+        ax1.set_ylabel('X Position (cm)')
+        ax1.set_title('Whole Trajectory Decoding: X Position vs. Time')
+        ax1.legend()
+        
+        # Plot Y Data
+        ax2.plot(t_dec, y_true, label='True Y', color='black', alpha=0.6, linewidth=2)
+        ax2.plot(t_dec, y_pred, label='Decoded Y', color='blue', s=10, alpha=0.7)
+        ax2.set_ylabel('Y Position (cm)')
+        ax2.set_xlabel('Time (s)')
+        ax2.set_title('Whole Trajectory Decoding: Y Position vs. Time')
+        ax2.legend()
+        
+        plt.tight_layout()
+        plt.show()
+
+    
+
+
+
+    def decode_whole_trajectory_with_prior(self, dt_decode=0.1, sigma_prior_cm=10.0):
+        """
+        Decodes the entire session using a Continuity Prior (Gaussian) 
+        centered on the previous estimated position.
+        """
+        # 1. Setup Time Windows
+        t_start = self.t[0]
+        t_end = self.t[-1]
+        time_bins = np.arange(t_start, t_end, dt_decode)
+        
+        # 2. Prepare Results Containers
+        # [time, est_x, est_y, true_x, true_y, confidence]
+        results = []
+        
+        # Initialize previous estimate as None (for the first frame, we use Uniform Prior)
+        prev_est = None 
+        
+        # Pre-calculate grid centers for the prior
+        X_grid, Y_grid = np.meshgrid(self.x_centers, self.y_centers, indexing='ij')
+        arena_mask = (X_grid**2 + Y_grid**2) <= (75**2)
+
+        for t_target in time_bins:
+            # Check if current speed is valid before decoding
+            v_now = np.interp(t_target, self.t, self.v)
+            if v_now < self.min_v or v_now > self.max_v:
+                continue    
+                
+            # --- STEP 1: CALCULATE LIKELIHOOD ---
+            # (Using logic from your compute_posterior_at_time)
+            w_start = t_target - dt_decode / 2.0
+            w_end = t_target + dt_decode / 2.0
+            
+            log_likelihood = np.zeros(self.rate_maps[next(iter(self.rate_maps))].shape)
+            eps = 1e-15
+            
+            for cell_id, rate_map in self.rate_maps.items():
+                spikes = self.spikes_by_cell[cell_id]
+                n_i = np.sum((spikes >= w_start) & (spikes < w_end))
+                log_likelihood += n_i * np.log(rate_map * dt_decode + eps) - (rate_map * dt_decode)
+
+            # --- STEP 2: APPLY CONTINUITY PRIOR ---
+            if prev_est is not None:
+                dist_sq = (X_grid - prev_est[0])**2 + (Y_grid - prev_est[1])**2
+                # Log of a Gaussian is just a parabolic penalty
+                log_prior = -dist_sq / (2 * sigma_prior_cm**2)
+                log_posterior = log_likelihood + log_prior
+            else:
+                # First frame or lost tracking: use Uniform Prior (log is 0)
+                log_posterior = log_likelihood
+
+            # --- STEP 3: APPLY ARENA MASK ---
+            log_posterior[~arena_mask] = -np.inf
+            
+            # --- STEP 4: MAP ESTIMATE & NORMALIZATION ---
+            if np.all(np.isinf(log_posterior)):
+                continue # Skip if everything is masked or invalid
+                
+            max_idx = np.unravel_index(np.argmax(log_posterior), log_posterior.shape)
+            est_x = self.x_centers[max_idx[0]]
+            est_y = self.y_centers[max_idx[1]]
+            
+            # Update prev_est for the next iteration
+            prev_est = (est_x, est_y)
+            
+            # Normalize for Confidence
+            shifted = log_posterior - np.max(log_posterior)
+            prob_dist = np.exp(shifted)
+            prob_dist /= np.sum(prob_dist)
+            confidence = np.max(prob_dist)
+            
+            # Get True Position for comparison
+            true_x = np.interp(t_target, self.t, self.x)
+            true_y = np.interp(t_target, self.t, self.y)
+            
+            results.append([t_target, est_x, est_y, true_x, true_y, confidence])
+
+        return np.array(results)
+    
+    def compute_posterior_at_time(self, t_target, dt_decode=0.1, arena_radius=75.0):
+        """
+        Computes the 2D Bayesian posterior probability of position 
+        for a single time window, strictly enforcing speed bounds.
+        """
+        # ==========================================
+        # 0. SPEED BOUNDARY CHECK
+        # ==========================================
+        v_now = np.interp(t_target, self.t, self.v)
+        
+        # Get all cell IDs and the grid shape from the first rate map
+        cell_ids = list(self.spikes_by_cell.keys())
+        grid_shape = self.rate_maps[cell_ids[0]].shape
+        
+        # If speed is invalid, return empty/invalid values immediately
+        if v_now < self.min_v or v_now > self.max_v:
+            # Return -inf for log posterior, NaNs for position, and 0 for confidence
+            return np.full(grid_shape, -np.inf), np.nan, np.nan, 0.0, 0
+
+        # --- Proceed with normal calculation if speed is valid ---
+        
+        w_start = t_target - dt_decode / 2.0
+        w_end = t_target + dt_decode / 2.0
+        
+        # 1. Initialize log posterior array with zeros
+        log_posterior = np.zeros(grid_shape)
+        eps = 1e-15
+        sum_n_i = 0  
+        
+        # 2. Iterate through every cell
+        for cell_id in cell_ids:
+            spikes = self.spikes_by_cell[cell_id]
+            n_i = np.sum((spikes >= w_start) & (spikes < w_end))
+            rate_map = self.rate_maps[cell_id]
+            
+            # Bayesian Likelihood (Poisson)
+            log_posterior += n_i * np.log(rate_map * dt_decode + eps) - (rate_map * dt_decode)
+            sum_n_i += n_i
+
+        # 3. Apply Arena Mask
+        x_centers = self.x_centers
+        y_centers = self.y_centers
+        X_grid, Y_grid = np.meshgrid(x_centers, y_centers, indexing='ij')
+        arena_mask = (X_grid**2 + Y_grid**2) <= (arena_radius**2)
+        log_posterior[~arena_mask] = -np.inf
+        
+        # 4. Find MAP Estimate
+        if np.all(np.isinf(log_posterior)):
+            return log_posterior, np.nan, np.nan, 0.0, sum_n_i
+            
+        max_idx = np.unravel_index(np.argmax(log_posterior), log_posterior.shape)
+        est_x = x_centers[max_idx[0]]
+        est_y = y_centers[max_idx[1]]
+
+        # 5. Normalization & Confidence
+        shifted_log_post = log_posterior - np.max(log_posterior)
+        posterior = np.exp(shifted_log_post)
+        posterior_sum = np.sum(posterior)
+        
+        if posterior_sum > 0:
+            posterior /= posterior_sum
+            normalized_log_posterior = shifted_log_post - np.log(posterior_sum)
+        else:
+            normalized_log_posterior = np.full(grid_shape, -np.inf)
+
+        confidence = np.max(posterior)
+        
+        return normalized_log_posterior, est_x, est_y, confidence, sum_n_i
 
 
 
